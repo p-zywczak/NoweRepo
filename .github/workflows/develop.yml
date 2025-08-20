@@ -16,40 +16,40 @@ jobs:
       runs-on: ubuntu-latest
       outputs:
         version: ${{ steps.bump.outputs.version }}
+        should_tag: ${{ steps.bump.outputs.should_tag }}
       steps:
-        - name: Checkout repository (full history)
+        - name: Checkout repository
           uses: actions/checkout@v4
           with:
             fetch-depth: 0
   
-        - name: Compute next SemVer from commits
+        - name: Decide bump and next version
           id: bump
           run: |
             set -euo pipefail
   
-            # Ostatni tag (albo 0.0.0 jeśli brak)
             LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-            echo "Last tag: $LAST_TAG"
-  
-            # Commity od ostatniego taga do HEAD
             COMMITS=$(git log --pretty=format:%s ${LAST_TAG}..HEAD || true)
   
-            # Domyślna podbitka
-            BUMP="patch"
+            # Domyślnie: nie tagujemy, dopóki nie wykryjemy typu zmiany
+            SHOULD_TAG=false
+            BUMP=""
   
-            # Reguły zgodne z Conventional Commits
             if echo "$COMMITS" | grep -E 'BREAKING CHANGE|!:' -q; then
-              BUMP="major"
+              BUMP="major"; SHOULD_TAG=true
             elif echo "$COMMITS" | grep -E '^feat(\(.+\))?:' -q; then
-              BUMP="minor"
+              BUMP="minor"; SHOULD_TAG=true
             elif echo "$COMMITS" | grep -E '^fix(\(.+\))?:' -q; then
-              BUMP="patch"
-            else
-              # jeśli brak dopasowania, dalej patch
-              BUMP="patch"
+              BUMP="patch"; SHOULD_TAG=true
             fi
   
-            # Parsowanie SemVer
+            echo "should_tag=${SHOULD_TAG}" >> "$GITHUB_OUTPUT"
+  
+            if [ "$SHOULD_TAG" != "true" ]; then
+              echo "Brak feat/fix/BREAKING – pomijam tagowanie."
+              exit 0
+            fi
+  
             CUR=${LAST_TAG#v}
             IFS='.' read -r MAJ MIN PAT <<< "$CUR"
   
@@ -60,15 +60,11 @@ jobs:
             esac
   
             NEW="v${MAJ}.${MIN}.${PAT}"
-            echo "New tag: $NEW"
+            echo "version=${NEW#v}"   >> "$GITHUB_OUTPUT"
+            echo "new_tag=$NEW"       >> "$GITHUB_OUTPUT"
   
-            # Wystaw jako output dla kolejnych jobów
-            echo "version=${NEW#v}" >> "$GITHUB_OUTPUT"
-            echo "new_tag=$NEW" >> "$GITHUB_OUTPUT"
-  
-        - name: Create & push git tag
-          env:
-            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        - name: Create & push git tag (only when needed)
+          if: steps.bump.outputs.should_tag == 'true'
           run: |
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"

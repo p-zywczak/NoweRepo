@@ -17,7 +17,7 @@ jobs:
       VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
       # VAULT_NAMESPACE: ${{ secrets.VAULT_NAMESPACE }} 
       VAULT_AUTH_PATH: auth/approle
-      VAULT_PATH: kv/data/test/dev
+      VAULT_PATH: kv/test/dev
       ENV_FILE: .env.example
     steps:
       - uses: actions/checkout@v4

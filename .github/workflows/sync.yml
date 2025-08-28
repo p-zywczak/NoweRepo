@@ -1,0 +1,39 @@
+name: Sync .env.example -> Vault
+
+on:
+  push:
+    paths:
+      - ".env.example"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+      VAULT_ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}
+      VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+      # VAULT_NAMESPACE: ${{ secrets.VAULT_NAMESPACE }} 
+      VAULT_AUTH_PATH: auth/approle
+      VAULT_PATH: test/dev
+      ENV_FILE: .env.example
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${VAULT_ROLE_ID}"
+          echo "::add-mask::${VAULT_SECRET_ID}"
+
+      - name: Install Vault CLI & jq
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq unzip
+          curl -fsSL https://releases.hashicorp.com/vault/1.17.5/vault_1.17.5_linux_amd64.zip -o vault.zip
+          unzip vault.zip && sudo install -m 0755 vault /usr/local/bin/vault
+
+      - name: Sync to Vault
+        run: |
+          chmod +x scripts/sync-env-to-vault.sh
+          ./scripts/sync-env-to-vault.sh "$VAULT_PATH" "$ENV_FILE"

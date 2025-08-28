@@ -7,10 +7,10 @@ set -euo pipefail
 #   ./scripts/sync-env-to-vault.sh secret/myapp/prod [.env.example]
 #
 # Wymagania: vault CLI, jq
-# Dodatkowe zmienne:
-#   VAULT_NAMESPACE   (opcjonalnie, Vault Enterprise)
+# Zmienne opcjonalne:
+#   VAULT_NAMESPACE   (Vault Enterprise)
 #   VAULT_AUTH_PATH   (domyślnie: auth/approle)
-#   DRY_RUN=1         (jeśli chcesz zobaczyć co doda bez zapisu)
+#   DRY_RUN=1         (pokaż zmiany bez zapisu)
 
 VAULT_PATH="${1:-}"
 ENV_FILE="${2:-.env.example}"
@@ -37,18 +37,26 @@ fi
 
 # --- Pobierz istniejące klucze (KV v2: .data.data) ---
 EXISTING_JSON=$(VAULT_NAMESPACE="$VAULT_NAMESPACE" vault kv get -format=json "$VAULT_PATH" 2>/dev/null || echo '{}')
-EXISTING_KEYS=$(echo "$EXISTING_JSON" | jq -r '.data.data | keys[]?' 2>/dev/null || true)
 
-declare -A EXIST
-for k in $EXISTING_KEYS; do EXIST["$k"]=1; done
+# Mapy istniejących kluczy i wartości
+declare -A EXIST EXIST_VALS
+while IFS=$'\t' read -r k v; do
+  [[ -z "${k:-}" ]] && continue
+  EXIST["$k"]=1
+  EXIST_VALS["$k"]="$v"
+done < <(echo "$EXISTING_JSON" | jq -r '.data.data | to_entries[]? | "\(.key)\t\(.value)"')
 
-declare -A TO_PUT
-FAIL=0
+# --- Parsuj .env.example: klucze docelowe + wartości domyślne (gdy nie "required") ---
+declare -A DESIRED DESIRED_VALS
+declare -a REQUIRED_MISSING=()
 
-# --- Parsowanie .env.example ---
+is_required_value() {
+  [[ "$1" =~ ^\<required\>$|^__SECRET__$|^REQUIRED$ ]]
+}
+
 while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-  # dopuszczamy "export KEY=VALUE"
+  # obsługa "export KEY=VALUE"
   if [[ "$line" =~ ^[[:space:]]*export[[:space:]]+ ]]; then
     line="${line#*export }"
   fi
@@ -58,35 +66,86 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     value="${line#*=}"
     key="$(echo -n "$key" | xargs)"
 
-    # usuń CR i otaczające pojedyncze/podwójne cudzysłowy
+    # usuń CR i otaczające cudzysłowy
     value="${value%$'\r'}"
     value="$(printf "%s" "$value" | sed -e 's/^"//; s/"$//' -e "s/^'//; s/'$//")"
 
-    # pomiń jeśli już jest w Vault
-    if [[ -z "${EXIST[$key]:-}" ]]; then
-      # marker pól wymagających ręcznego ustawienia
-      if [[ "$value" =~ ^\<required\>$|^__SECRET__$|^REQUIRED$ ]]; then
-        echo "✗ Brak wartości dla wymagającego klucza: $key — ustaw ręcznie w Vault."
-        FAIL=1
-      else
-        TO_PUT["$key"]="$value"
+    DESIRED["$key"]=1
+    if is_required_value "$value"; then
+      # jeśli w Vault nie ma wartości dla required -> zgłoś błąd
+      if [[ -z "${EXIST[$key]:-}" ]]; then
+        REQUIRED_MISSING+=("$key")
       fi
+      # nie ustawiaj domyślnej wartości
+    else
+      DESIRED_VALS["$key"]="$value"
     fi
   fi
 done < "$ENV_FILE"
 
-# --- Zapis brakujących kluczy ---
-if (( ${#TO_PUT[@]} > 0 )); then
-  echo "➜ Dodaję ${#TO_PUT[@]} klucze do $VAULT_PATH: ${!TO_PUT[@]}"
-  if [[ "${DRY_RUN:-0}" == "1" ]]; then
-    echo "DRY_RUN=1 — pominąłem zapis."
+# --- Wyznacz zestawy zmian ---
+declare -a TO_ADD=() TO_DELETE=() TO_KEEP=()
+
+# Do dodania: klucze z .env.example, których nie ma w Vault i nie są "required"
+for k in "${!DESIRED[@]}"; do
+  if [[ -z "${EXIST[$k]:-}" ]]; then
+    if [[ -n "${DESIRED_VALS[$k]:-}" ]]; then
+      TO_ADD+=("$k")
+    fi
   else
-    ARGS=()
-    for k in "${!TO_PUT[@]}"; do ARGS+=("$k=${TO_PUT[$k]}"); done
-    VAULT_NAMESPACE="$VAULT_NAMESPACE" vault kv patch "$VAULT_PATH" "${ARGS[@]}"
+    TO_KEEP+=("$k")
   fi
+done
+
+# Do usunięcia: klucze, które są w Vault, a nie ma ich w .env.example
+for k in "${!EXIST[@]}"; do
+  if [[ -z "${DESIRED[$k]:-}" ]]; then
+    TO_DELETE+=("$k")
+  fi
+done
+
+# --- Zbuduj nowy zestaw danych do wgrania (PUT nadpisze całość wersji) ---
+declare -A NEW_DATA
+# 1) Zostaw istniejące wartości dla kluczy, które są w schemacie
+for k in "${TO_KEEP[@]}"; do
+  NEW_DATA["$k"]="${EXIST_VALS[$k]}"
+done
+# 2) Dodaj nowe klucze z wartościami z .env.example
+for k in "${TO_ADD[@]}"; do
+  NEW_DATA["$k"]="${DESIRED_VALS[$k]}"
+done
+# Klucze z TO_DELETE NIE są w NEW_DATA -> będą „wycięte”
+
+# --- Raport zmian ---
+echo "Stan docelowy ($VAULT_PATH):"
+echo "  • Zostają:  ${#TO_KEEP[@]}  -> ${TO_KEEP[*]:-—}"
+echo "  • Do dodania: ${#TO_ADD[@]} -> ${TO_ADD[*]:-—}"
+echo "  • Do usunięcia: ${#TO_DELETE[@]} -> ${TO_DELETE[*]:-—}"
+
+if (( ${#REQUIRED_MISSING[@]} > 0 )); then
+  echo "✗ Brakuje wartości dla wymaganych kluczy (oznaczonych w .env.example): ${REQUIRED_MISSING[*]}" >&2
+  FAIL=1
 else
-  echo "✓ Brak brakujących kluczy."
+  FAIL=0
+fi
+
+# Brak zmian?
+if (( ${#TO_ADD[@]} == 0 && ${#TO_DELETE[@]} == 0 )); then
+  echo "✓ Brak zmian do zastosowania."
+  exit $FAIL
+fi
+
+# --- Zapis nowej wersji (PUT) lub DRY_RUN ---
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  echo "DRY_RUN=1 — pominąłem zapis do Vault."
+else
+  # Zbuduj argumenty key=value (jeden element tablicy na parę, żeby zachować spacje i '=')
+  ARGS=()
+  for k in "${!NEW_DATA[@]}"; do
+    ARGS+=("$k=${NEW_DATA[$k]}")
+  done
+  echo "➜ Wgrywam nową wersję sekreta (z pruningiem): ${#ARGS[@]} kluczy."
+  VAULT_NAMESPACE="$VAULT_NAMESPACE" vault kv put "$VAULT_PATH" "${ARGS[@]}"
 fi
 
 exit $FAIL
